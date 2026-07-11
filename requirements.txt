@@ -1,4 +1,6 @@
-flask
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+Flask
 requests
 telethon
 pycloudflared
+gunicorn
