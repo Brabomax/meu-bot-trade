@@ -10,14 +10,27 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import re
 from pycloudflared import try_cloudflare
+import concurrent.futures
 
 # ════════════════════════════════════════════════════════════════════════
-# BANCO DE DADOS SQLITE
+# FUNÇÃO SALVA-VIDAS (TIMEOUT)
+# ════════════════════════════════════════════════════════════════════════
+def call_with_timeout(func, timeout, *args, **kwargs):
+    """Executa uma função com timeout para evitar travamentos da API"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return "TIMEOUT"
+
+# ════════════════════════════════════════════════════════════════════════
+# BANCO DE DADOS SQLITE (COM TIMEOUT)
 # ════════════════════════════════════════════════════════════════════════
 DB_PATH = "shield_bots.db"
 
 def init_database():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS active_bots (
@@ -35,7 +48,7 @@ def init_database():
 init_database()
 
 def salvar_bot_db(bot_id, email, config):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO active_bots (bot_id, email, config, status, last_heartbeat)
@@ -45,7 +58,7 @@ def salvar_bot_db(bot_id, email, config):
     conn.close()
 
 def atualizar_heartbeat(bot_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         UPDATE active_bots 
@@ -56,7 +69,7 @@ def atualizar_heartbeat(bot_id):
     conn.close()
 
 def get_bot_status_db(bot_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT bot_id, email, config, status, 
@@ -68,7 +81,7 @@ def get_bot_status_db(bot_id):
     conn.close()
     if result:
         minutes_idle = result[4] if result[4] else 999
-        is_alive = minutes_idle < 2
+        is_alive = (minutes_idle * 24 * 60) < 2
         return {
             'exists': True,
             'status': result[3],
@@ -79,7 +92,7 @@ def get_bot_status_db(bot_id):
     return {'exists': False}
 
 def remover_bot_db(bot_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('DELETE FROM active_bots WHERE bot_id = ?', (bot_id,))
     conn.commit()
@@ -150,7 +163,7 @@ def parsear_resultado_telegram(texto):
         print(f"Erro parsear resultado: {e}")
         return None
 
-# ════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 # PARSER DE SINAIS DO TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════
 def parsear_sinal_telegram(texto):
@@ -245,7 +258,7 @@ def parsear_sinal_telegram(texto):
         return None
 
 # ════════════════════════════════════════════════════════════════════════
-# TELEGRAM LISTENER
+# TELEGRAM LISTENER (COM RECONEXÃO AUTOMÁTICA)
 # ════════════════════════════════════════════════════════════════════════
 class TelegramListener(threading.Thread):
     def __init__(self, api_id, api_hash, phone, group_id, fila_sinais, fila_resultados, log_fn, session_str=""):
@@ -289,41 +302,61 @@ class TelegramListener(threading.Thread):
         self._client = TelegramClient(session, self.api_id, self.api_hash, loop=self._loop)
 
         async def main():
-            await self._client.start(phone=self.phone)
-            self.log(f"✅ Conectado! Escutando grupo {self.group_id}")
-
-            @self._client.on(events.NewMessage)
-            async def handler(event):
+            while not self._stop_evt.is_set():
                 try:
-                    texto = event.raw_text or ""
-                    if str(event.chat_id) != str(self.group_id):
-                        return
-                    resultado = parsear_resultado_telegram(texto)
-                    if resultado:
-                        self.log(f"📊 RESULTADO RECONHECIDO: {resultado['tipo']} (${resultado['lucro']:.2f})")
-                        self.fila_resultados.append(resultado)
-                        return
-                    sinal = parsear_sinal_telegram(texto)
-                    if sinal:
-                        self.log(f"✅ SINAL RECONHECIDO: {sinal}")
-                        self.fila_sinais.append(sinal)
-                    else:
-                        self.log("❌ PARSER NÃO RECONHECEU A MENSAGEM")
-                except Exception as e:
-                    self.log(f"❌ ERRO HANDLER: {e}")
+                    if not self._client.is_connected():
+                        await self._client.connect()
+                    
+                    if not await self._client.is_user_authorized():
+                        self.log("❌ Sessão Telegram expirada. Precisa de novo código.")
+                        break
 
-            await self._client.run_until_disconnected()
+                    self.log(f"✅ Conectado ao Telegram! Escutando grupo {self.group_id}")
+
+                    @self._client.on(events.NewMessage)
+                    async def handler(event):
+                        try:
+                            texto = event.raw_text or ""
+                            if str(event.chat_id) != str(self.group_id): return
+                            
+                            resultado = parsear_resultado_telegram(texto)
+                            if resultado:
+                                self.log(f"📊 RESULTADO RECONHECIDO: {resultado['tipo']} (${resultado['lucro']:.2f})")
+                                self.fila_resultados.append(resultado)
+                                return
+                                
+                            sinal = parsear_sinal_telegram(texto)
+                            if sinal:
+                                self.log(f"✅ SINAL RECONHECIDO: {sinal}")
+                                self.fila_sinais.append(sinal)
+                            else:
+                                self.log("❌ PARSER NÃO RECONHECEU A MENSAGEM")
+                        except Exception as e:
+                            self.log(f"❌ ERRO HANDLER: {e}")
+
+                    self.log("🔄 Iniciando escuta de mensagens...")
+                    await self._client.run_until_disconnected()
+                    
+                except Exception as e:
+                    if not self._stop_evt.is_set():
+                        self.log(f"⚠️ Erro no Telegram: {str(e)}. Reconectando em 15s...")
+                        await asyncio.sleep(15)
+                finally:
+                    try:
+                        if self._client.is_connected():
+                            await self._client.disconnect()
+                    except: pass
 
         try:
             self._loop.run_until_complete(main())
         except Exception as e:
             if not self._stop_evt.is_set():
-                self.log(f"⚠️ Erro: {str(e)}")
+                self.log(f"⚠️ Erro fatal: {str(e)}")
         finally:
             self.log("🔌 Desconectado")
 
 # ════════════════════════════════════════════════════════════════════════
-# IQ OPTION API
+# IQ OPTION API (BLINDADA COM TIMEOUT)
 # ════════════════════════════════════════════════════════════════════════
 class IQOptionAPI:
     def __init__(self, email, senha):
@@ -387,7 +420,8 @@ class IQOptionAPI:
     def check_connect(self):
         try:
             if self.api and self.conectado:
-                return self.api.check_connect()
+                res = call_with_timeout(self.api.check_connect, 5)
+                return res != "TIMEOUT" and res
             return False
         except:
             return False
@@ -404,22 +438,26 @@ class IQOptionAPI:
         try:
             if not self.check_connect():
                 return None
-            candles = self.api.get_candles(par, timeframe, quantidade, time.time())
+            
+            candles = call_with_timeout(self.api.get_candles, 10, par, timeframe, quantidade, time.time())
+            
+            if candles == "TIMEOUT":
+                print(f"⚠️ TIMEOUT em get_candles. Reconectando...")
+                self.reconnect()
+                return None
+                
             if not candles or not isinstance(candles, list) or len(candles) < quantidade:
                 return None
+                
             validated = []
             for c in candles:
                 if all(k in c for k in ['open', 'close', 'max', 'min', 'from']):
                     try:
                         validated.append({
-                            'open': float(c['open']),
-                            'close': float(c['close']),
-                            'high': float(c['max']),
-                            'low': float(c['min']),
-                            'time': c['from']
+                            'open': float(c['open']), 'close': float(c['close']),
+                            'high': float(c['max']), 'low': float(c['min']), 'time': c['from']
                         })
-                    except:
-                        continue
+                    except: continue
             return validated if len(validated) >= 20 else None
         except Exception:
             return None
@@ -437,7 +475,11 @@ class IQOptionAPI:
         print(f"🛒 COMPRANDO: {par} | {dir_iq} | ${valor:.2f} | {duracao}min")
 
         try:
-            ok, oid = self.api.buy(valor, par, dir_iq, duracao)
+            res = call_with_timeout(self.api.buy, 15, valor, par, dir_iq, duracao)
+            if res == "TIMEOUT":
+                self.reconnect()
+                return False, "Timeout na compra"
+            ok, oid = res
             if ok and oid:
                 return True, oid
         except Exception as e:
@@ -461,23 +503,32 @@ class IQOptionAPI:
 
         return False, "Nenhum método de compra funcionou"
 
-    def check_win_v4(self, id_ordem):
+    def check_win_v4(self, id_ordem, duracao_min=1):
         try:
             if not self.check_connect():
                 return False, 0
-            time.sleep(65)
-            resultado = self.api.check_win_v3(id_ordem)
-            if resultado is not None and resultado > 0:
-                return True, resultado
-            else:
+            
+            tempo_max_espera = (duracao_min * 60) + 20
+            tempo_inicial = time.time()
+            
+            while time.time() - tempo_inicial < tempo_max_espera:
+                time.sleep(5)
                 try:
-                    status = self.api.get_order_status(id_ordem)
-                    if status and 'amount' in status:
-                        return True, -float(status['amount'])
-                except:
+                    res = call_with_timeout(self.api.check_win_v3, 10, id_ordem)
+                    if res != "TIMEOUT" and res is not None and res != 0:
+                        return True, float(res)
+                except Exception:
                     pass
-                return True, -0.01
-        except Exception:
+            
+            try:
+                res = call_with_timeout(self.api.check_win_v3, 10, id_ordem)
+                if res != "TIMEOUT" and res is not None:
+                    return True, float(res)
+            except: pass
+                
+            return True, -0.01
+        except Exception as e:
+            print(f"Erro check_win_v4: {e}")
             return False, 0
 
     def close(self):
@@ -589,18 +640,6 @@ class MotorIA:
 
     @staticmethod
     def detectar_velas_doidas(cand, max_pavios_permitidos=1, fator_pavio=2.5):
-        """
-        Detecta se há velas com pavios excessivos (mercado volátil/indeciso)
-        
-        Args:
-            cand: Lista de candles
-            max_pavios_permitidos: Máximo de velas com pavio grande permitido
-            fator_pavio: Pavio deve ser X vezes maior que o corpo para ser considerado "doido"
-        
-        Returns:
-            True se tem velas doidas (deve rejeitar)
-            False se tá normal (pode operar)
-        """
         try:
             if not cand or len(cand) < 5:
                 return False
@@ -648,7 +687,7 @@ class MotorIA:
             return {}
 
 # ═══════════════════════════════════════════════════════════════════════
-# LOOP PRINCIPAL COM GERENCIAMENTO POR CICLOS
+# LOOP PRINCIPAL COM LOGS DETALHADOS E CONTADOR DE FALHAS
 # ════════════════════════════════════════════════════════════════════════
 def loop_robo(sid, d, logs_dict):
     api = None
@@ -657,6 +696,10 @@ def loop_robo(sid, d, logs_dict):
     sinais_processados = []
     ultimas_operacoes = {}
     prejuizo_acumulado = 0.0
+
+    # 🔧 CONTADOR DE FALHAS DE CONEXÃO
+    falhas_conexao = 0
+    max_falhas = 5
 
     usar_ciclos = d.get('usar_ciclos', False)
     ciclos_config = d.get('ciclos', [])
@@ -818,7 +861,7 @@ def loop_robo(sid, d, logs_dict):
                 return False, 0, 0
 
             atualizar_log(f"✅ Ordem enviada! ID: {resultado}\n")
-            check, lucro = api_obj.check_win_v4(resultado)
+            check, lucro = api_obj.check_win_v4(resultado, duracao_min=duracao)
             if check:
                 b_at = api_obj.get_balance()
                 if b_at is None:
@@ -963,11 +1006,30 @@ def loop_robo(sid, d, logs_dict):
                 now = datetime.now()
                 hora_atual = now.strftime("%H:%M")
 
+                # 🔧 VERIFICAÇÃO DE CONEXÃO COM CONTADOR DE FALHAS
                 if not api.check_connect():
-                    atualizar_log("🔄 Reconectando IQ...\n")
+                    falhas_conexao += 1
+                    atualizar_log(f"🔄 Reconectando IQ... (Falha #{falhas_conexao}/{max_falhas})\n")
+                    
+                    if falhas_conexao >= max_falhas:
+                        atualizar_log(f"❌ MUITAS FALHAS DE CONEXÃO! Aguardando 30s...\n")
+                        time.sleep(30)
+                        falhas_conexao = 0
+                    
                     api.reconnect()
                     time.sleep(3)
+                    
+                    if api.check_connect():
+                        atualizar_log(f"✅ Reconectado com sucesso!\n")
+                        falhas_conexao = 0
+                    else:
+                        atualizar_log(f"⚠️ Ainda sem conexão. Tentando novamente...\n")
+                    
                     continue
+                else:
+                    if falhas_conexao > 0:
+                        atualizar_log(f"✅ Conexão estabilizada\n")
+                        falhas_conexao = 0
 
                 if now.second % 5 == 0:
                     b_atual = api.get_balance()
@@ -1034,11 +1096,12 @@ def loop_robo(sid, d, logs_dict):
                                 atualizar_log(f"  {est:5s}: {bar} {perc:3d}%\n")
                     atualizar_log(f"═══════════════════════\n\n")
 
+                # 🔧 PROCESSAMENTO DE SINAIS COM LOGS DETALHADOS
                 if modo_telegram:
                     sinais_coletados = fila_pop_all()
                     
                     if sinais_coletados:
-                        atualizar_log(f" {len(sinais_coletados)} sinal(is) recebido(s) [M{tg_timeframe}]\n")
+                        atualizar_log(f"📨 {len(sinais_coletados)} sinal(is) recebido(s) [M{tg_timeframe}]\n")
                         
                         if opera_apos_loss_ativo and not modo_operacao_liberado:
                             atualizar_log(f"⏸️ Aguardando {loss_target - loss_count} LOSS seguidos para liberar operações...\n")
@@ -1060,43 +1123,46 @@ def loop_robo(sid, d, logs_dict):
                                 continue
                             
                             sinais_validos = []
-                            for sinal in sinais:
+                            for idx_sinal, sinal in enumerate(sinais, 1):
                                 par_tg = sinal.get('par', 'EURUSD-OTC')
                                 dir_tg = sinal.get('direcao', 'call')
                                 valor_tg = sinal.get('valor', float(d.get('ent', 2.00)))
                                 duracao_tg = sinal.get('duracao', tg_timeframe)
                                 
+                                atualizar_log(f"🔍 Analisando sinal {idx_sinal}/{len(sinais)}: {par_tg} {dir_tg.upper()} {horario}\n")
+                                
                                 chave_tg = f"{par_tg}_{horario}_{dir_tg}"
                                 if chave_tg in sinais_tg_executados:
-                                    atualizar_log(f"⏭️ TG {par_tg} {horario} já executado\n")
+                                    atualizar_log(f"⏭️ {par_tg} {horario} já executado anteriormente\n")
                                     continue
                                 
+                                atualizar_log(f"   📊 Buscando candles para {par_tg}...\n")
                                 cand_tg = api.get_candles(par_tg, 60, 40)
                                 if not cand_tg:
-                                    atualizar_log(f"⚠️ TG {par_tg} sem candles\n")
+                                    atualizar_log(f"   ❌ FALHA: Não foi possível obter candles para {par_tg}\n")
                                     continue
+                                atualizar_log(f"   ✅ Candles obtidos: {len(cand_tg)} velas\n")
                                 
                                 flts_tg = MotorIA.calcular_filtros_pro(cand_tg)
                                 
                                 if d.get("filtro_confluencia") and flts_tg['tendencia'] != dir_tg:
-                                    atualizar_log(f"🚫 TG {par_tg} {horario} rejeitado: contra tendência\n")
+                                    atualizar_log(f"   🚫 REJEITADO: Contra tendência ({flts_tg['tendencia']} vs {dir_tg})\n")
                                     continue
                                 
                                 if d.get("filtro_antiloss") and not flts_tg['sequencia_ok']:
-                                    atualizar_log(f"🛑 TG {par_tg} {horario} rejeitado: Anti-Loss\n")
+                                    atualizar_log(f"   🛑 REJEITADO: Anti-Loss (sequência de 4 velas iguais)\n")
                                     continue
                                 
                                 if d.get("filtro_volatilidade") and not MotorIA.filtrar_volatilidade(cand_tg):
-                                    atualizar_log(f"⚡ TG {par_tg} {horario} rejeitado: Volatilidade\n")
+                                    atualizar_log(f"   ⚡ REJEITADO: Volatilidade fora do padrão\n")
                                     continue
                                 
-                                # 🆕 FILTRO DE VELAS DOIDAS
                                 if d.get("filtro_velas_doidas"):
                                     fator_pavio = float(d.get("fator_pavio", 2.5))
                                     max_pavios = int(d.get("max_pavios_permitidos", 1))
                                     
                                     if MotorIA.detectar_velas_doidas(cand_tg, max_pavios, fator_pavio):
-                                        atualizar_log(f"🛑 TG {par_tg} {horario} rejeitado: Velas doidas (pavios excessivos)\n")
+                                        atualizar_log(f"   🛑 REJEITADO: Velas doidas (pavios excessivos)\n")
                                         continue
                                 
                                 if d.get("modo_inteligente"):
@@ -1104,33 +1170,37 @@ def loop_robo(sid, d, logs_dict):
                                     if tipo_mercado == "lateral":
                                         sinal_5v = Motor.analisar_sinal_unico("5VELA", cand_tg)
                                         if not sinal_5v or sinal_5v != dir_tg:
-                                            atualizar_log(f"🧠 TG {par_tg} {horario} rejeitado: Mercado lateral\n")
+                                            atualizar_log(f"   🧠 REJEITADO: Mercado lateral\n")
                                             continue
                                 
                                 if d.get("usar_5vela"):
                                     sinal_5v = Motor.analisar_sinal_unico("5VELA", cand_tg)
                                     if not sinal_5v or sinal_5v != dir_tg:
-                                        atualizar_log(f"🎯 TG {par_tg} {horario} rejeitado: 5ª Vela\n")
+                                        atualizar_log(f"   🎯 REJEITADO: 5ª Vela não confirma\n")
                                         continue
                                 
                                 rank_tg = None
                                 best_rank = 0
                                 
                                 if not d.get('tg_sem_ranking', False):
+                                    atualizar_log(f"   📈 Calculando ranking...\n")
                                     rank_tg = MotorIA.catalogar_v36(api, par_tg, estrategias_ativas)
                                     if rank_tg:
                                         best_rank = max(rank_tg.values()) if rank_tg else 0
                                         if best_rank < min_rank_filtro:
-                                            atualizar_log(f" TG {par_tg} {horario} rejeitado: Ranking {best_rank}% < {min_rank_filtro}%\n")
+                                            atualizar_log(f"   📉 REJEITADO: Ranking {best_rank}% < {min_rank_filtro}%\n")
                                             continue
+                                        atualizar_log(f"   ✅ Ranking: {best_rank}%\n")
                                     else:
-                                        atualizar_log(f"⚠️ TG {par_tg} sem ranking\n")
+                                        atualizar_log(f"   ⚠️ REJEITADO: Não foi possível calcular ranking\n")
                                         continue
                                 else:
-                                    atualizar_log(f"📱 TG {par_tg} {horario} - Ignorando filtro de ranking\n")
+                                    atualizar_log(f"   📱 Ignorando filtro de ranking\n")
                                     best_rank = 100
                                 
+                                atualizar_log(f"   🎯 Calculando score...\n")
                                 score = calcular_score_sinal(sinal, api, estrategias_ativas)
+                                atualizar_log(f"   ✅ Score: {score}\n")
                                 
                                 sinais_validos.append({
                                     'sinal': sinal,
@@ -1138,12 +1208,13 @@ def loop_robo(sid, d, logs_dict):
                                     'cand': cand_tg,
                                     'rank': best_rank
                                 })
+                                atualizar_log(f"   ✅ Sinal APROVADO para execução\n")
                             
                             sinais_validos.sort(key=lambda x: x['score'], reverse=True)
                             sinais_para_executar = sinais_validos[:max_sinais_horario - sinais_ja_executados]
                             
                             if not sinais_para_executar:
-                                atualizar_log(f"⚠️ Nenhum sinal válido para {horario}\n")
+                                atualizar_log(f"⚠️ Nenhum sinal válido para {horario} (todos rejeitados)\n")
                                 continue
                             
                             atualizar_log(f"🎯 {len(sinais_para_executar)} sinal(is) selecionado(s) para {horario}\n")
@@ -1170,7 +1241,7 @@ def loop_robo(sid, d, logs_dict):
                                     
                                     diff = (hora_alvo - datetime.now()).total_seconds()
                                     if diff < -10:
-                                        atualizar_log(f"⏰ Sinal atrasado {horario_tg} ({diff:.0f}s)\n")
+                                        atualizar_log(f"⏰ Sinal atrasado {horario_tg} ({diff:.0f}s) - pulando\n")
                                         continue
                                     elif diff > 0:
                                         atualizar_log(f"⏳ Aguardando {horario_tg} ({diff:.0f}s)\n")
@@ -1187,15 +1258,20 @@ def loop_robo(sid, d, logs_dict):
                                 v_ent_tg = round(v_ent_tg, 2)
                                 
                                 chave_tg = f"{par_tg}_{horario_tg}_{dir_tg}"
-                                if not pode_operar(chave_tg) or chave_tg in sinais_tg_executados:
-                                    atualizar_log(f"⏭️ {par_tg} bloqueado por pode_operar\n")
+                                if not pode_operar(chave_tg):
+                                    atualizar_log(f"⏭️ {par_tg} bloqueado por pode_operar (operou há menos de 60s)\n")
                                     continue
+                                
                                 sinais_tg_executados.add(chave_tg)
                                 
-                                atualizar_log(f"📨 TG: {par_tg} {dir_tg.upper()} {horario_tg} | Score: {sinal_info['score']} | Rank: {sinal_info['rank']}%\n")
+                                atualizar_log(f"📨 EXECUTANDO: {par_tg} {dir_tg.upper()} {horario_tg} | Score: {sinal_info['score']} | Rank: {sinal_info['rank']}%\n")
                                 
-                                gerenciar_operacao(api, v_ent_tg, par_tg, dir_tg, sid, d, 
+                                ok, v_ent_final, lucro = gerenciar_operacao(api, v_ent_tg, par_tg, dir_tg, sid, d, 
                                                  duracao=duracao_tg, modo="telegram")
+                                
+                                if not ok:
+                                    sinais_tg_executados.discard(chave_tg)
+                                    atualizar_log(f"🔄 Sinal removido da lista de executados (permitindo retentativa)\n")
                                 
                                 sinais_por_horario_executados[horario] = sinais_por_horario_executados.get(horario, 0) + 1
 
@@ -1402,7 +1478,7 @@ def tg_confirmar_codigo():
     return jsonify(res)
 
 # ════════════════════════════════════════════════════════════════════════
-# HTML COMPLETO COM FILTRO VELAS DOIDAS
+# HTML COMPLETO
 # ════════════════════════════════════════════════════════════════════════
 HTML_SISTEMA = """
 <!DOCTYPE html>
@@ -1432,6 +1508,8 @@ textarea { height: 80px; font-family: monospace; font-size: 12px; }
 .status-running { background: #00c853; }
 .status-stopped { background: #f44336; }
 .status-offline { background: #ff9800; }
+.status-travado { background: #9c27b0; animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: 0.3; } }
 .badge-iq { background:#4CAF50; padding:2px 8px; border-radius:12px; font-size:11px; margin-left:8px; }
 .badge-tg { background:#1565C0; color:#fff; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; }
 .tg-lbl { font-size:12px; color:#90CAF9; display:block; margin-bottom:2px; }
@@ -2037,6 +2115,9 @@ setInterval(() => {
         } else if (d.status === 'finalizado') {
             statusSpan.innerText = '⏹️ Bot finalizado';
             statusInd.className = 'bot-status status-stopped';
+        } else if (d.status === 'travado') {
+            statusSpan.innerText = '❌ BOT TRAVOU! Reinicie';
+            statusInd.className = 'bot-status status-travado';
         } else {
             statusSpan.innerText = '🔄 Verificando...';
             statusInd.className = 'bot-status status-offline';
@@ -2058,7 +2139,7 @@ setTimeout(() => {
 """
 
 # ════════════════════════════════════════════════════════════════════════
-# ROTAS FLASK
+# ROTAS FLASK (COM WATCHDOG)
 # ════════════════════════════════════════════════════════════════════════
 @app.route('/')
 def index():
@@ -2066,12 +2147,25 @@ def index():
 
 @app.route('/status/<sid>')
 def get_status(sid):
+    db_status = get_bot_status_db(sid)
+    if db_status.get('exists') and not db_status.get('is_alive'):
+        if sid in processos:
+            try:
+                processos[sid].terminate()
+                del processos[sid]
+            except: pass
+        return jsonify({
+            "msg": "\n❌ BOT TRAVOU! (Sem heartbeat por 2 min). Reinicie o bot.\n", 
+            "status": "travado"
+        })
+
     if sid in logs_web:
         res = logs_web[sid].copy()
         temp = logs_web[sid]
         temp['msg'] = ""
         logs_web[sid] = temp
         return jsonify(res)
+        
     return jsonify({"msg": ""})
 
 @app.route('/check_bot/<sid>')
@@ -2149,7 +2243,7 @@ def iniciar_cloudflare():
 # PONTO DE ENTRADA
 # ════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    print("SHIELD V37 - IQ OPTION + TELEGRAM")
+    print("SHIELD V37 - IQ OPTION + TELEGRAM (ANTI-TRAVAMENTO)")
     print("Acesse: http://0.0.0.0:5006")
     
     manager = multiprocessing.Manager()
