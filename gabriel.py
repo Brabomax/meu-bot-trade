@@ -73,15 +73,15 @@ def get_bot_status_db(bot_id):
     cursor = conn.cursor()
     cursor.execute('''
         SELECT bot_id, email, config, status, 
-               julianday('now') - julianday(last_heartbeat) as minutes_since_heartbeat
+               julianday('now') - julianday(last_heartbeat) as days_since_heartbeat
         FROM active_bots 
         WHERE bot_id = ?
     ''', (bot_id,))
     result = cursor.fetchone()
     conn.close()
     if result:
-        minutes_idle = result[4] if result[4] else 999
-        is_alive = (minutes_idle * 24 * 60) < 2
+        days_idle = result[4] if result[4] else 999
+        is_alive = (days_idle * 24 * 60) < 2  # Menos de 2 minutos
         return {
             'exists': True,
             'status': result[3],
@@ -356,7 +356,7 @@ class TelegramListener(threading.Thread):
             self.log("🔌 Desconectado")
 
 # ════════════════════════════════════════════════════════════════════════
-# IQ OPTION API (BLINDADA COM TIMEOUT)
+# IQ OPTION API (BLINDADA COM TIMEOUT - VERSÃO CONSERVADORA)
 # ════════════════════════════════════════════════════════════════════════
 class IQOptionAPI:
     def __init__(self, email, senha):
@@ -435,9 +435,12 @@ class IQOptionAPI:
             return None
 
     def get_candles(self, par, timeframe, quantidade):
+        """Versão conservadora: só reconecta se houver problema real"""
         try:
             if not self.check_connect():
-                return None
+                print(f"⚠️ Conexão instável detectada. Reconectando...")
+                self.reconnect()
+                time.sleep(2)
             
             candles = call_with_timeout(self.api.get_candles, 10, par, timeframe, quantidade, time.time())
             
@@ -446,7 +449,10 @@ class IQOptionAPI:
                 self.reconnect()
                 return None
                 
+            # Validação: se retornar lista vazia ou incompleta, força reconexão
             if not candles or not isinstance(candles, list) or len(candles) < quantidade:
+                print(f"⚠️ Dados de velas incompletos ({len(candles) if candles else 0}/{quantidade}). Reconectando...")
+                self.reconnect()
                 return None
                 
             validated = []
@@ -458,8 +464,20 @@ class IQOptionAPI:
                             'high': float(c['max']), 'low': float(c['min']), 'time': c['from']
                         })
                     except: continue
-            return validated if len(validated) >= 20 else None
-        except Exception:
+            
+            # Se após validar ainda faltar velas, reconecta
+            if len(validated) < 20:
+                print(f"⚠️ Velas validadas insuficientes ({len(validated)}). Reconectando...")
+                self.reconnect()
+                return None
+                
+            return validated
+        except Exception as e:
+            print(f"Erro crítico em get_candles: {e}. Reconectando...")
+            try:
+                self.reconnect()
+            except:
+                pass
             return None
 
     def buy(self, valor, par, direcao, duracao=1):
@@ -700,6 +718,10 @@ def loop_robo(sid, d, logs_dict):
     # 🔧 CONTADOR DE FALHAS DE CONEXÃO
     falhas_conexao = 0
     max_falhas = 5
+    
+    # 🔧 AUTO-REINÍCIO SEGURO (Evita vazamento de memória em execuções > 6h)
+    tempo_inicio = time.time()
+    TEMPO_MAXIMO_EXECUCAO = 6 * 60 * 60  # 6 horas em segundos
 
     usar_ciclos = d.get('usar_ciclos', False)
     ciclos_config = d.get('ciclos', [])
@@ -924,7 +946,7 @@ def loop_robo(sid, d, logs_dict):
         while True:
             time.sleep(25)
             contador += 1
-            atualizar_log(f"💓 HEARTBEAT #{contador} - Wins Reais:{wins_reais_bot} Loss:{logs_dict[sid]['loss']} | Prej Acum: ${prejuizo_acumulado:.2f} | Ciclo: {ciclo_atual}\n")
+            atualizar_log(f"💓 HEARTBEAT #{contador} - Wins Reais:{wins_reais_bot} Loss:{logs_dict[sid].get('loss', 0)} | Prej Acum: ${prejuizo_acumulado:.2f} | Ciclo: {ciclo_atual}\n")
             atualizar_heartbeat(sid)
             if not get_bot_status_db(sid).get('exists', False):
                 break
@@ -1005,6 +1027,22 @@ def loop_robo(sid, d, logs_dict):
                 time.sleep(1)
                 now = datetime.now()
                 hora_atual = now.strftime("%H:%M")
+
+                # ═══════════════════════════════════════════════════════════
+                # LIMPEZA DE MEMÓRIA A CADA 1 HORA (Evita travamento por acúmulo)
+                # ═══════════════════════════════════════════════════════════
+                if now.minute == 0 and now.second == 0:
+                    tempo_limite = time.time() - 7200  # 2 horas em segundos
+                    
+                    # Limpa dicionário de operações antigas
+                    chaves_para_remover = [k for k, v in ultimas_operacoes.items() if v < tempo_limite]
+                    for k in chaves_para_remover:
+                        del ultimas_operacoes[k]
+                    
+                    # Limpa set de sinais executados se ficar muito grande
+                    if len(sinais_tg_executados) > 500:
+                        sinais_tg_executados.clear()
+                        atualizar_log("🧹 Memória de sinais limpa para evitar lentidão.\n")
 
                 # 🔧 VERIFICAÇÃO DE CONEXÃO COM CONTADOR DE FALHAS
                 if not api.check_connect():
@@ -1240,8 +1278,8 @@ def loop_robo(sid, d, logs_dict):
                                         hora_alvo = datetime.now()
                                     
                                     diff = (hora_alvo - datetime.now()).total_seconds()
-                                    if diff < -10:
-                                        atualizar_log(f"⏰ Sinal atrasado {horario_tg} ({diff:.0f}s) - pulando\n")
+                                    if diff < -30:  # Aumentado para 30 segundos de tolerância
+                                        atualizar_log(f"⏰ Sinal muito atrasado {horario_tg} ({diff:.0f}s) - pulando\n")
                                         continue
                                     elif diff > 0:
                                         atualizar_log(f"⏳ Aguardando {horario_tg} ({diff:.0f}s)\n")
@@ -1363,6 +1401,14 @@ def loop_robo(sid, d, logs_dict):
                         
                         gerenciar_operacao(api, v_ent, melhor['par'], melhor['sinal'], sid, d,
                                          duracao=auto_timeframe, modo="auto")
+
+                # ═══════════════════════════════════════════════════════════
+                # AUTO-REINÍCIO PROGRAMADO (Garantia de estabilidade 24/7)
+                # ═══════════════════════════════════════════════════════════
+                if time.time() - tempo_inicio > TEMPO_MAXIMO_EXECUCAO:
+                    atualizar_log("⏱️ TEMPO MÁXIMO DE SESSÃO ATINGIDO (6h). Finalizando com segurança para renovar conexão...\n")
+                    atualizar_log("💡 Dica: Use um script .bat ou PM2 para reiniciar automaticamente.\n")
+                    break  # Sai do loop de forma segura, acionando o 'finally' de limpeza
 
             except Exception as e:
                 atualizar_log(f"⚠️ Erro no loop: {str(e)}\n")
@@ -2113,7 +2159,7 @@ setInterval(() => {
             statusSpan.innerText = '✅ Bot em execução';
             statusInd.className = 'bot-status status-running';
         } else if (d.status === 'finalizado') {
-            statusSpan.innerText = '⏹️ Bot finalizado';
+            statusSpan.innerText = '⏹️ Bot finalizado (Sessão concluída. Reinicie para continuar)';
             statusInd.className = 'bot-status status-stopped';
         } else if (d.status === 'travado') {
             statusSpan.innerText = '❌ BOT TRAVOU! Reinicie';
@@ -2139,7 +2185,7 @@ setTimeout(() => {
 """
 
 # ════════════════════════════════════════════════════════════════════════
-# ROTAS FLASK (COM WATCHDOG)
+# ROTAS FLASK
 # ════════════════════════════════════════════════════════════════════════
 @app.route('/')
 def index():
