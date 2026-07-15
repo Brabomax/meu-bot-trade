@@ -718,10 +718,6 @@ def loop_robo(sid, d, logs_dict):
     # 🔧 CONTADOR DE FALHAS DE CONEXÃO
     falhas_conexao = 0
     max_falhas = 5
-    
-    # 🔧 AUTO-REINÍCIO SEGURO (Evita vazamento de memória em execuções > 6h)
-    tempo_inicio = time.time()
-    TEMPO_MAXIMO_EXECUCAO = 6 * 60 * 60  # 6 horas em segundos
 
     usar_ciclos = d.get('usar_ciclos', False)
     ciclos_config = d.get('ciclos', [])
@@ -1401,14 +1397,6 @@ def loop_robo(sid, d, logs_dict):
                         
                         gerenciar_operacao(api, v_ent, melhor['par'], melhor['sinal'], sid, d,
                                          duracao=auto_timeframe, modo="auto")
-
-                # ═══════════════════════════════════════════════════════════
-                # AUTO-REINÍCIO PROGRAMADO (Garantia de estabilidade 24/7)
-                # ═══════════════════════════════════════════════════════════
-                if time.time() - tempo_inicio > TEMPO_MAXIMO_EXECUCAO:
-                    atualizar_log("⏱️ TEMPO MÁXIMO DE SESSÃO ATINGIDO (6h). Finalizando com segurança para renovar conexão...\n")
-                    atualizar_log("💡 Dica: Use um script .bat ou PM2 para reiniciar automaticamente.\n")
-                    break  # Sai do loop de forma segura, acionando o 'finally' de limpeza
 
             except Exception as e:
                 atualizar_log(f"⚠️ Erro no loop: {str(e)}\n")
@@ -2159,7 +2147,7 @@ setInterval(() => {
             statusSpan.innerText = '✅ Bot em execução';
             statusInd.className = 'bot-status status-running';
         } else if (d.status === 'finalizado') {
-            statusSpan.innerText = '⏹️ Bot finalizado (Sessão concluída. Reinicie para continuar)';
+            statusSpan.innerText = '⏹️ Bot finalizado';
             statusInd.className = 'bot-status status-stopped';
         } else if (d.status === 'travado') {
             statusSpan.innerText = '❌ BOT TRAVOU! Reinicie';
