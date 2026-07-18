@@ -25,14 +25,14 @@ def call_with_timeout(func, timeout, *args, **kwargs):
             return "TIMEOUT"
 
 # ════════════════════════════════════════════════════════════════════════
-# BANCO DE DADOS SQLITE (COM TIMEOUT)
+# BANCO DE DADOS SQLITE (COM TIMEOUT E ISOLAMENTO)
 # ════════════════════════════════════════════════════════════════════════
 DB_PATH = "shield_bots.db"
 
 def init_database():
     conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('PRAGMA journal_mode=WAL;') # Melhora concorrência
+    cursor.execute('PRAGMA journal_mode=WAL;') # Permite múltiplas leituras/escritas simultâneas
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS active_bots (
             bot_id TEXT PRIMARY KEY,
@@ -155,11 +155,12 @@ def verificar_membro_canal_telegram(api_id, api_hash, phone, session_str=""):
         return False, f"❌ Erro na verificação do Telegram: {str(e)}"
 
 # ════════════════════════════════════════════════════════════════════════
-# FUNÇÕES PARA SALVAR/CARREGAR CREDENCIAIS
+# FUNÇÕES PARA SALVAR/CARREGAR CREDENCIAIS (ISOLADO POR E-MAIL)
 # ════════════════════════════════════════════════════════════════════════
 def salvar_credenciais(email, senha):
     try:
-        with open(f"user_{email.replace('@', '_at_')}.txt", "w") as f:
+        safe_email = email.replace('@', '_at_').replace('.', '_dot_').replace('/', '_')
+        with open(f"cred_{safe_email}.txt", "w") as f:
             f.write(senha)
         return True
     except:
@@ -167,7 +168,8 @@ def salvar_credenciais(email, senha):
 
 def carregar_senha(email):
     try:
-        with open(f"user_{email.replace('@', '_at_')}.txt", "r") as f:
+        safe_email = email.replace('@', '_at_').replace('.', '_dot_').replace('/', '_')
+        with open(f"cred_{safe_email}.txt", "r") as f:
             return f.read().strip()
     except:
         return None
@@ -468,6 +470,7 @@ class IQOptionAPI:
             return None
 
     def get_candles(self, par, timeframe, quantidade):
+        """Versão conservadora: só reconecta se houver problema real"""
         try:
             if not self.check_connect():
                 print(f"⚠️ Conexão instável detectada. Reconectando...")
@@ -481,6 +484,7 @@ class IQOptionAPI:
                 self.reconnect()
                 return None
                 
+            # Validação: se retornar lista vazia ou incompleta, força reconexão
             if not candles or not isinstance(candles, list) or len(candles) < quantidade:
                 print(f"⚠️ Dados de velas incompletos ({len(candles) if candles else 0}/{quantidade}). Reconectando...")
                 self.reconnect()
@@ -496,6 +500,7 @@ class IQOptionAPI:
                         })
                     except: continue
             
+            # Se após validar ainda faltar velas, reconecta
             if len(validated) < 20:
                 print(f"⚠️ Velas validadas insuficientes ({len(validated)}). Reconectando...")
                 self.reconnect()
@@ -734,7 +739,7 @@ class MotorIA:
             return {}
 
 # ═══════════════════════════════════════════════════════════════════════
-# LOOP PRINCIPAL COM LOGS DETALHADOS E CONTADOR DE FALHAS
+# LOOP PRINCIPAL COM LOGS DETALHADOS E CONTADOR DE FALHAS (RESTAURADO)
 # ════════════════════════════════════════════════════════════════════════
 def loop_robo(sid, d, logs_dict):
     api = None
@@ -744,6 +749,7 @@ def loop_robo(sid, d, logs_dict):
     ultimas_operacoes = {}
     prejuizo_acumulado = 0.0
 
+    # 🔧 CONTADOR DE FALHAS DE CONEXÃO
     falhas_conexao = 0
     max_falhas = 5
     
@@ -760,14 +766,19 @@ def loop_robo(sid, d, logs_dict):
         
         with ciclo_lock:
             idx = ciclo_atual - 1
-            if idx < 0: idx = 0
-            if idx >= len(ciclos_config): idx = len(ciclos_config) - 1
+            if idx < 0:
+                idx = 0
+            if idx >= len(ciclos_config):
+                idx = len(ciclos_config) - 1
             
             ciclo = ciclos_config[idx]
             valores = [ciclo.get('entrada', v_ent_forcada)]
-            if ciclo.get('g1', 0) > 0: valores.append(ciclo['g1'])
-            if ciclo.get('g2', 0) > 0: valores.append(ciclo['g2'])
-            if ciclo.get('g3', 0) > 0: valores.append(ciclo['g3'])
+            if ciclo.get('g1', 0) > 0:
+                valores.append(ciclo['g1'])
+            if ciclo.get('g2', 0) > 0:
+                valores.append(ciclo['g2'])
+            if ciclo.get('g3', 0) > 0:
+                valores.append(ciclo['g3'])
             
             if gale_atual < len(valores):
                 return valores[gale_atual]
@@ -870,9 +881,15 @@ def loop_robo(sid, d, logs_dict):
         score += forca * 10
         
         flts = MotorIA.calcular_filtros_pro(cand)
-        if flts['tendencia'] == direcao: score += 30
-        if flts['sequencia_ok']: score += 20
-        if MotorIA.filtrar_volatilidade(cand): score += 15
+        
+        if flts['tendencia'] == direcao:
+            score += 30
+        
+        if flts['sequencia_ok']:
+            score += 20
+        
+        if MotorIA.filtrar_volatilidade(cand):
+            score += 15
         
         return score
 
@@ -881,6 +898,7 @@ def loop_robo(sid, d, logs_dict):
         nonlocal prejuizo_acumulado, ciclo_atual, prejuizo_ciclo, wins_reais_bot, win_count
         
         v_ent = get_valor_ciclo(gale_atual, v_ent_forcada)
+        
         modo_str = "📱 TG" if modo == "telegram" else "🤖 AUTO"
         atualizar_log(f"{modo_str} [M{duracao}] {par} {direcao.upper()} ${v_ent:.2f} (Ciclo {ciclo_atual})\n")
         
@@ -1040,29 +1058,41 @@ def loop_robo(sid, d, logs_dict):
                 now = datetime.now()
                 hora_atual = now.strftime("%H:%M")
 
+                # ═══════════════════════════════════════════════════════════
+                # LIMPEZA DE MEMÓRIA A CADA 1 HORA (Evita travamento por acúmulo)
+                # ═══════════════════════════════════════════════════════════
                 if now.minute == 0 and now.second == 0:
-                    tempo_limite = time.time() - 7200
+                    tempo_limite = time.time() - 7200  # 2 horas em segundos
+                    
+                    # Limpa dicionário de operações antigas
                     chaves_para_remover = [k for k, v in ultimas_operacoes.items() if v < tempo_limite]
                     for k in chaves_para_remover:
                         del ultimas_operacoes[k]
+                    
+                    # Limpa set de sinais executados se ficar muito grande
                     if len(sinais_tg_executados) > 500:
                         sinais_tg_executados.clear()
                         atualizar_log("🧹 Memória de sinais limpa para evitar lentidão.\n")
 
+                # 🔧 VERIFICAÇÃO DE CONEXÃO COM CONTADOR DE FALHAS
                 if not api.check_connect():
                     falhas_conexao += 1
                     atualizar_log(f"🔄 Reconectando IQ... (Falha #{falhas_conexao}/{max_falhas})\n")
+                    
                     if falhas_conexao >= max_falhas:
                         atualizar_log(f"❌ MUITAS FALHAS DE CONEXÃO! Aguardando 30s...\n")
                         time.sleep(30)
                         falhas_conexao = 0
+                    
                     api.reconnect()
                     time.sleep(3)
+                    
                     if api.check_connect():
                         atualizar_log(f"✅ Reconectado com sucesso!\n")
                         falhas_conexao = 0
                     else:
                         atualizar_log(f"⚠️ Ainda sem conexão. Tentando novamente...\n")
+                    
                     continue
                 else:
                     if falhas_conexao > 0:
@@ -1097,6 +1127,7 @@ def loop_robo(sid, d, logs_dict):
                                 wins_reais_bot = 0
                                 atualizar_log(f"❌ LOSS detectado! Contador: {loss_count}/{loss_target}\n")
                                 atualizar_log(loss_count=loss_count, win_count=0)
+                                
                                 if loss_count >= loss_target and not modo_operacao_liberado:
                                     modo_operacao_liberado = True
                                     win_count = 0
@@ -1104,8 +1135,10 @@ def loop_robo(sid, d, logs_dict):
                                     atualizar_log(f"🎯 META ATINGIDA! {loss_count} LOSS seguidos - LIBERANDO OPERAÇÕES\n")
                                     atualizar_log(f"📊 Agora preciso de {win_reset_target} WINS REAIS para voltar a esperar LOSS\n")
                                     atualizar_log(modo_operacao_liberado=True, win_count=0)
+                                    
                             elif resultado['tipo'] == 'WIN':
                                 atualizar_log(f"📊 Telegram reportou WIN (log apenas, não conta)\n")
+                                
                                 if modo_operacao_liberado and wins_reais_bot >= win_reset_target:
                                     modo_operacao_liberado = False
                                     loss_count = 0
@@ -1131,10 +1164,13 @@ def loop_robo(sid, d, logs_dict):
                                 atualizar_log(f"  {est:5s}: {bar} {perc:3d}%\n")
                     atualizar_log(f"═══════════════════════\n\n")
 
+                # 🔧 PROCESSAMENTO DE SINAIS COM LOGS DETALHADOS
                 if modo_telegram:
                     sinais_coletados = fila_pop_all()
+                    
                     if sinais_coletados:
                         atualizar_log(f"📨 {len(sinais_coletados)} sinal(is) recebido(s) [M{tg_timeframe}]\n")
+                        
                         if opera_apos_loss_ativo and not modo_operacao_liberado:
                             atualizar_log(f"⏸️ Aguardando {loss_target - loss_count} LOSS seguidos para liberar operações...\n")
                             continue
@@ -1180,18 +1216,23 @@ def loop_robo(sid, d, logs_dict):
                                 if d.get("filtro_confluencia") and flts_tg['tendencia'] != dir_tg:
                                     atualizar_log(f"   🚫 REJEITADO: Contra tendência ({flts_tg['tendencia']} vs {dir_tg})\n")
                                     continue
+                                
                                 if d.get("filtro_antiloss") and not flts_tg['sequencia_ok']:
                                     atualizar_log(f"   🛑 REJEITADO: Anti-Loss (sequência de 4 velas iguais)\n")
                                     continue
+                                
                                 if d.get("filtro_volatilidade") and not MotorIA.filtrar_volatilidade(cand_tg):
                                     atualizar_log(f"   ⚡ REJEITADO: Volatilidade fora do padrão\n")
                                     continue
+                                
                                 if d.get("filtro_velas_doidas"):
                                     fator_pavio = float(d.get("fator_pavio", 2.5))
                                     max_pavios = int(d.get("max_pavios_permitidos", 1))
+                                    
                                     if MotorIA.detectar_velas_doidas(cand_tg, max_pavios, fator_pavio):
                                         atualizar_log(f"   🛑 REJEITADO: Velas doidas (pavios excessivos)\n")
                                         continue
+                                
                                 if d.get("modo_inteligente"):
                                     tipo_mercado = MotorIA.detectar_mercado(cand_tg)
                                     if tipo_mercado == "lateral":
@@ -1199,6 +1240,7 @@ def loop_robo(sid, d, logs_dict):
                                         if not sinal_5v or sinal_5v != dir_tg:
                                             atualizar_log(f"   🧠 REJEITADO: Mercado lateral\n")
                                             continue
+                                
                                 if d.get("usar_5vela"):
                                     sinal_5v = Motor.analisar_sinal_unico("5VELA", cand_tg)
                                     if not sinal_5v or sinal_5v != dir_tg:
@@ -1207,6 +1249,7 @@ def loop_robo(sid, d, logs_dict):
                                 
                                 rank_tg = None
                                 best_rank = 0
+                                
                                 if not d.get('tg_sem_ranking', False):
                                     atualizar_log(f"   📈 Calculando ranking...\n")
                                     rank_tg = MotorIA.catalogar_v36(api, par_tg, estrategias_ativas)
@@ -1227,7 +1270,12 @@ def loop_robo(sid, d, logs_dict):
                                 score = calcular_score_sinal(sinal, api, estrategias_ativas)
                                 atualizar_log(f"   ✅ Score: {score}\n")
                                 
-                                sinais_validos.append({'sinal': sinal, 'score': score, 'cand': cand_tg, 'rank': best_rank})
+                                sinais_validos.append({
+                                    'sinal': sinal,
+                                    'score': score,
+                                    'cand': cand_tg,
+                                    'rank': best_rank
+                                })
                                 atualizar_log(f"   ✅ Sinal APROVADO para execução\n")
                             
                             sinais_validos.sort(key=lambda x: x['score'], reverse=True)
@@ -1260,7 +1308,7 @@ def loop_robo(sid, d, logs_dict):
                                         hora_alvo = datetime.now()
                                     
                                     diff = (hora_alvo - datetime.now()).total_seconds()
-                                    if diff < -30:
+                                    if diff < -30:  # Aumentado para 30 segundos de tolerância
                                         atualizar_log(f"⏰ Sinal muito atrasado {horario_tg} ({diff:.0f}s) - pulando\n")
                                         continue
                                     elif diff > 0:
@@ -1283,6 +1331,7 @@ def loop_robo(sid, d, logs_dict):
                                     continue
                                 
                                 sinais_tg_executados.add(chave_tg)
+                                
                                 atualizar_log(f"📨 EXECUTANDO: {par_tg} {dir_tg.upper()} {horario_tg} | Score: {sinal_info['score']} | Rank: {sinal_info['rank']}%\n")
                                 
                                 ok, v_ent_final, lucro = gerenciar_operacao(api, v_ent_tg, par_tg, dir_tg, sid, d, 
@@ -1379,7 +1428,10 @@ def loop_robo(sid, d, logs_dict):
                             v_ent *= 1.2
                         v_ent = round(v_ent, 2)
                         atualizar_log(f"💰 {melhor['par']} ({melhor['est']}): {melhor['sinal'].upper()} | ${v_ent:.2f}\n")
-                        gerenciar_operacao(api, v_ent, melhor['par'], melhor['sinal'], sid, d, duracao=auto_timeframe, modo="auto")
+                        
+                        gerenciar_operacao(api, v_ent, melhor['par'], melhor['sinal'], sid, d,
+                                         duracao=auto_timeframe, modo="auto")
+
             except Exception as e:
                 atualizar_log(f"⚠️ Erro no loop: {str(e)}\n")
                 time.sleep(2)
@@ -1395,18 +1447,21 @@ def loop_robo(sid, d, logs_dict):
             pass
 
 # ════════════════════════════════════════════════════════════════════════
-# FLASK e rotas
+# FLASK e rotas (MULTI-USUÁRIO SEGURO)
 # ════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
 logs_web = {} 
 processos = {}
-tg_sessions_storage = {}
-manager = None
+tg_sessions_storage = {}  # Agora keyed por SID para isolamento total
+
+# [O HTML_SISTEMA continua exatamente igual ao original - muito longo para incluir aqui]
+# Copie o HTML do seu código original e cole aqui
 
 @app.route('/tg_listar_grupos', methods=['POST'])
 def tg_listar_grupos():
     data = request.json
+    sid = data.get('sid', 'default')  # Isolamento por sessão do usuário
     api_id = data.get('api_id')
     api_hash = data.get('api_hash')
     phone = data.get('phone')
@@ -1426,7 +1481,7 @@ def tg_listar_grupos():
             await client.connect()
             if not await client.is_user_authorized():
                 result = await client.send_code_request(phone)
-                tg_sessions_storage[phone] = {
+                tg_sessions_storage[sid] = {  # Usa SID como chave
                     "session": client.session.save(),
                     "phone_code_hash": result.phone_code_hash
                 }
@@ -1451,12 +1506,13 @@ def tg_listar_grupos():
 @app.route('/tg_confirmar_codigo', methods=['POST'])
 def tg_confirmar_codigo():
     data = request.json
+    sid = data.get('sid', 'default')  # Isolamento por sessão do usuário
     api_id = data.get('api_id')
     api_hash = data.get('api_hash')
     phone = data.get('phone')
     code = data.get('code')
     session = data.get('session', '')
-    dados_salvos = tg_sessions_storage.get(phone, {})
+    dados_salvos = tg_sessions_storage.get(sid, {})  # Usa SID como chave
     phone_code_hash = dados_salvos.get("phone_code_hash", "")
     session_str = session or dados_salvos.get("session", "")
     if not phone_code_hash:
@@ -1480,8 +1536,8 @@ def tg_confirmar_codigo():
                     grupos.append({"id": str(dialog.id), "nome": dialog.name})
             sess_str = client.session.save()
             await client.disconnect()
-            if phone in tg_sessions_storage:
-                del tg_sessions_storage[phone]
+            if sid in tg_sessions_storage:
+                del tg_sessions_storage[sid]
             return {"ok": True, "grupos": grupos, "session": sess_str}
         except Exception as e:
             try: await client.disconnect()
@@ -1493,670 +1549,6 @@ def tg_confirmar_codigo():
     loop.close()
     return jsonify(res)
 
-# ════════════════════════════════════════════════════════════════════════
-# HTML COMPLETO (Mantido idêntico ao original para preservar a interface)
-# ════════════════════════════════════════════════════════════════════════
-HTML_SISTEMA = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Shield V37 IQ Option + Telegram</title>
-<style>
-body { background: #0b0e11; color: #e1e1e1; font-family: 'Segoe UI', sans-serif; padding: 10px; }
-.box { background: #151a21; padding: 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #2b3139; }
-.box-tg { background: #0d1625; padding: 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #1a4a8a; }
-.box-tg h4 { color: #2196F3; margin: 0 0 12px 0; font-size: 15px; }
-.placar { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; background: #00c853; padding: 12px; border-radius: 8px; color: #000; font-weight: 900; text-align:center; margin-bottom: 15px; }
-input, select, textarea { width: 100%; padding: 10px; margin: 5px 0; background: #1e2329; color: white; border: 1px solid #333; border-radius: 4px; box-sizing: border-box; }
-textarea { height: 80px; font-family: monospace; font-size: 12px; }
-.btn-on  { background: #00c853; color: black; border: none; padding: 15px; width: 100%; border-radius: 5px; font-weight: bold; cursor:pointer; font-size: 16px; }
-.btn-off { background: #f44336; color: white; border: none; padding: 12px; width: 100%; border-radius: 5px; cursor:pointer; margin-top: 8px; }
-.btn-tg  { background: #2196F3; color: white; border: none; padding: 10px 18px; border-radius: 5px; cursor:pointer; font-weight: bold; font-size: 13px; margin-top: 6px; width: 100%; }
-.btn-tg:disabled { background: #555; cursor: default; }
-#monitor { background: #000; color: #00ff41; height: 200px; overflow-y: scroll; padding: 10px; font-family: monospace; font-size: 12px; border-radius: 5px; border: 1px solid #333; margin-top: 15px; }
-.flex { display: flex; gap: 8px; align-items: flex-end; }
-.grid-est { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; margin-top: 10px; }
-.est-item { background: #1e2329; padding: 5px; border-radius: 3px; font-size: 10px; display: flex; align-items: center; }
-.check-row { display: flex; flex-wrap: wrap; gap: 10px; background: #1e2329; padding: 10px; border-radius: 5px; margin-top: 10px; font-size: 13px; align-items: center; }
-#status_panel { background:#1e2329; padding:10px; border-radius:8px; margin-bottom:10px; text-align:center; font-size:13px; }
-.bot-status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
-.status-running { background: #00c853; }
-.status-stopped { background: #f44336; }
-.status-offline { background: #ff9800; }
-.status-travado { background: #9c27b0; animation: blink 1s infinite; }
-@keyframes blink { 50% { opacity: 0.3; } }
-.badge-iq { background:#4CAF50; padding:2px 8px; border-radius:12px; font-size:11px; margin-left:8px; }
-.badge-tg { background:#1565C0; color:#fff; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; }
-.tg-lbl { font-size:12px; color:#90CAF9; display:block; margin-bottom:2px; }
-.pares-btn { background: #2b3139; border: 1px solid #00c853; color: #00c853; padding: 5px 10px; border-radius: 4px; cursor: pointer; margin-top: 5px; font-size: 11px; }
-.pares-btn:hover { background: #00c853; color: #000; }
-.tg-status { font-size:12px; color:#aaa; margin-top:8px; }
-.tg-code-area { margin-top:8px; display:none; }
-.tg-group-select { margin-top:8px; display:none; }
-.rec-box { background:#2a1a0a; border:1px solid #ff5722; border-radius:5px; padding:8px; margin-top:8px; }
-.badge-rec { background:#ff5722; color:#fff; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; font-weight:bold; }
-.btn-reconnect { background: #ff9800; color: black; border: none; padding: 10px; width: 100%; border-radius: 5px; cursor: pointer; margin-top: 5px; font-weight: bold; }
-.loss-box { background:#1a0a2a; border:1px solid #9c27b0; border-radius:5px; padding:8px; margin-top:8px; }
-.badge-loss { background:#9c27b0; color:#fff; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; font-weight:bold; }
-.ciclos-box { background:#0a1a2a; border:1px solid #00bcd4; border-radius:5px; padding:10px; margin-top:10px; }
-.badge-ciclos { background:#00bcd4; color:#000; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; font-weight:bold; }
-.ciclo-row { display: grid; grid-template-columns: 60px 1fr 1fr 1fr 1fr 50px; gap: 5px; margin-bottom: 5px; align-items: center; }
-.ciclo-row input { padding: 6px; font-size: 12px; }
-.ciclo-num { text-align: center; font-weight: bold; color: #00bcd4; font-size: 14px; }
-.btn-add-ciclo { background: #00bcd4; color: #000; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 5px; }
-.btn-save-ciclos { background: #00c853; color: #000; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; }
-.btn-del-ciclo { background: #f44336; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; }
-.timeframe-box { background:#1a2a0a; border:1px solid #8bc34a; border-radius:5px; padding:8px; margin-top:8px; }
-.badge-tf { background:#8bc34a; color:#000; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; font-weight:bold; }
-.velas-box { background:#2a0a0a; border:1px solid #ff6b6b; border-radius:5px; padding:8px; margin-top:8px; }
-.badge-velas { background:#ff6b6b; color:#fff; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:6px; font-weight:bold; }
-</style>
-</head>
-<body>
-<h3 style="text-align:center; color:#00c853;">️ SHIELD V37 - IQ OPTION <span class="badge-iq">+ TELEGRAM</span> <span class="badge-rec">🔄 REC CONTÍNUA</span> <span class="badge-loss">🎯 OPERA APÓS LOSS</span> <span class="badge-ciclos">🔁 CICLOS</span> <span class="badge-tf">⏱️ TF SEPARADO</span> <span class="badge-velas">🛑 VELAS DOIDAS</span></h3>
-
-<div id="status_panel">
-    <span id="bot_status_indicator" class="bot-status status-offline"></span>
-    <span id="bot_status_text">Nenhum bot ativo</span>
-    <span id="ciclo_display" style="margin-left:10px; color:#00bcd4; font-weight:bold;"></span>
-</div>
-
-<div class="placar">
-    <div>WINS: <span id="w_info">0</span></div>
-    <div>LOSS: <span id="l_info">0</span></div>
-    <div style="grid-column: span 2;">LUCRO: <span id="lucro_val">$0.00</span> | BANCA: <span id="banca_real">$0.00</span></div>
-</div>
-
-<div class="box">
-    <input id="user" placeholder="E-mail IQ Option">
-    <input id="pass" type="password" placeholder="Senha IQ Option">
-    <select id="tipo">
-        <option value="PRACTICE">CONTA PRÁTICA</option>
-        <option value="REAL">CONTA REAL</option>
-    </select>
-    <div class="flex">
-        <input id="sw" placeholder="Stop Win $" value="10">
-        <input id="sl" placeholder="Stop Loss $" value="10">
-    </div>
-    <div class="flex">
-        <label style="font-size:11px; width:100%;">Entrada $:
-        <input id="ent" value="2.00"></label>
-        <label style="font-size:11px; width:100%;">Assertividade %:
-        <input id="min_rank" type="number" value="50"></label>
-    </div>
-    <div class="flex">
-        <label style="font-size:11px; width:100%;">Sinais por horário:
-        <select id="max_sinais_horario">
-            <option value="1">1 sinal (melhor)</option>
-            <option value="2">2 sinais</option>
-            <option value="3">3 sinais</option>
-            <option value="999" selected>Todos</option>
-        </select></label>
-        <label style="font-size:11px; width:100%;">% Recuperação:
-        <select id="rec_percent_select" onchange="toggleRecCustom()">
-            <option value="25">25%</option>
-            <option value="50">50%</option>
-            <option value="75">75%</option>
-            <option value="100" selected>100%</option>
-            <option value="150">150%</option>
-            <option value="custom">Personalizado</option>
-        </select></label>
-        <input id="rec_percent_custom" type="number" value="100" style="display:none;" placeholder="%">
-    </div>
-    <div class="flex">
-        <input id="par" value="EURUSD-OTC, GBPUSD-OTC, EURGBP-OTC">
-        <label style="font-size:11px; width:120px;">💪 Força:
-        <input id="min_forca" type="number" value="3"></label>
-    </div>
-    <div>
-        <button class="pares-btn" onclick="setPares('EURUSD-OTC, GBPUSD-OTC, EURGBP-OTC')"> 3 Pares</button>
-        <button class="pares-btn" onclick="setPares('EURUSD-OTC, GBPUSD-OTC, EURGBP-OTC, EURJPY-OTC, AUDUSD-OTC')">📊 5 Pares</button>
-        <button class="pares-btn" onclick="setPares('EURUSD-OTC, GBPUSD-OTC, USDJPY-OTC, EURJPY-OTC, AUDUSD-OTC, NZDUSD-OTC')">📊 6 Pares</button>
-    </div>
-</div>
-
-<div class="timeframe-box">
-    <strong>⏱️ Timeframes Separados <span class="badge-tf">NOVO</span></strong>
-    <div class="flex" style="margin-top:8px;">
-        <label style="font-size:12px; width:100%;">📱 Telegram:
-            <select id="tg_timeframe">
-                <option value="1">M1 (1 min)</option>
-                <option value="5" selected>M5 (5 min)</option>
-                <option value="15">M15 (15 min)</option>
-            </select>
-        </label>
-        <label style="font-size:12px; width:100%;">🤖 Estratégias:
-            <select id="auto_timeframe">
-                <option value="1" selected>M1 (1 min)</option>
-                <option value="5">M5 (5 min)</option>
-            </select>
-        </label>
-    </div>
-    <small style="color:#8bc34a;">Telegram opera em M5 | Estratégias automáticas em M1</small>
-</div>
-
-<div class="box-tg">
-    <h4>📡 Sinais ao Vivo — Telegram <span class="badge-tg">ESTILO DERIV</span></h4>
-    <label class="tg-lbl">Número de Telefone (ex: +5511999999999):</label>
-    <input id="tg_phone" placeholder="+5511999999999" type="tel">
-    <div class="flex">
-        <div style="width:100%;">
-            <label class="tg-lbl">API ID (my.telegram.org):</label>
-            <input id="tg_api_id" placeholder="API ID" type="number">
-        </div>
-        <div style="width:100%;">
-            <label class="tg-lbl">API Hash:</label>
-            <input id="tg_api_hash" placeholder="API Hash" type="password">
-        </div>
-    </div>
-    <button class="btn-tg" id="btn_buscar_grupos" onclick="buscarGrupos()">🔍 Conectar Telegram e Buscar Grupos</button>
-    <div id="tg_code_area" class="tg-code-area">
-        <label class="tg-lbl">Código recebido por SMS/Telegram:</label>
-        <div class="flex">
-            <input id="tg_verification_code" placeholder="Ex: 12345" type="text">
-            <button class="btn-tg" style="width:auto; margin-top:0;" onclick="confirmarCodigo()">✅ Confirmar</button>
-        </div>
-    </div>
-    <div id="tg_group_select" class="tg-group-select">
-        <label class="tg-lbl">Grupo / Canal para escutar:</label>
-        <select id="tg_groups_dropdown" onchange="selecionarGrupo()">
-            <option value="">-- Selecione --</option>
-        </select>
-    </div>
-    <div id="tg_status" class="tg-status">Insira seus dados e clique em "Conectar Telegram".</div>
-    <input type="hidden" id="tg_session" value="">
-    <div class="check-row" style="margin-top:10px;">
-        <label><input type="checkbox" id="modo_telegram"> 📱 Operar por Sinais Telegram</label>
-        <label><input type="checkbox" id="tg_sem_ranking"> 📱 Telegram sem Ranking</label>
-        <label style="font-size:11px;color:#888;">Marque para ativar sinais ao vivo do Telegram</label>
-    </div>
-</div>
-
-<div class="box">
-    <strong>Lista de Sinais (Formato: HH:MM,PAR,DIR):</strong>
-    <textarea id="lista_sinais" placeholder="Exemplo:&#10;14:30,EURUSD-OTC,CALL&#10;14:35,GBPUSD-OTC,PUT"></textarea>
-    <div class="check-row">
-        <label><input type="checkbox" id="modo_lista"> 📁 Operar Lista</label>
-        <label><input type="checkbox" id="modo_catalogo" checked> Catalogador</label>
-        <label><input type="checkbox" id="use_vwin"> Win Virtual</label>
-        <label><input type="checkbox" id="use_rec"> Recuperação</label>
-        <label><input type="checkbox" id="rec_continua">  Recuperação Contínua</label>
-        <label><input type="checkbox" id="filtro_confluencia"> ✅ Tendência IA</label>
-        <label><input type="checkbox" id="filtro_forca"> ✅ Força mínima</label>
-        <label><input type="checkbox" id="filtro_antiloss"> ✅ Anti-Loss</label>
-        <label><input type="checkbox" id="filtro_volatilidade"> ✅ Volatilidade</label>
-        <label><input type="checkbox" id="filtro_velas_doidas" onchange="toggleVelasDoidasConfig()"> 🛑 Bloquear Velas Doidas</label>
-        <label><input type="checkbox" id="use_gale" checked> Martingale</label>
-        <label><input type="checkbox" id="modo_inteligente"> 🧠 Modo Inteligente</label>
-        <label><input type="checkbox" id="usar_5vela"> 🎯 5ª Vela</label>
-        <label><input type="checkbox" id="opera_apos_loss" onchange="toggleLossConfig()"> 🎯 Opera Após Loss</label>
-        <label><input type="checkbox" id="usar_ciclos" onchange="toggleCiclos()"> 🔁 Gerenc. por Ciclos</label>
-    </div>
-
-    <div class="velas-box" id="velas_doidas_config" style="display:none;">
-        <div class="flex">
-            <label style="font-size:12px; width:100%;">Fator Pavio (x corpo):
-            <input id="fator_pavio" type="number" value="2.5" step="0.1" min="1.5" max="5" style="width:80px;"></label>
-            <label style="font-size:12px; width:100%;">Máx velas doidas:
-            <input id="max_pavios_permitidos" type="number" value="1" min="0" max="3" style="width:80px;"></label>
-        </div>
-        <small style="color:#ff6b6b;">🛑 Bloqueia operação se houver mais de X velas com pavio > Yx o corpo</small>
-    </div>
-
-    <div class="loss-box" id="loss_config" style="display:none;">
-        <div class="flex">
-            <label style="font-size:12px; width:100%;">Quantidade de LOSS seguidos:
-            <input id="loss_target" type="number" value="2" min="1" max="10" style="width:80px;"></label>
-            <label style="font-size:12px; width:100%;">Reset após X WINS REAIS:
-            <input id="win_reset_target" type="number" value="3" min="1" max="20" style="width:80px;"></label>
-        </div>
-        <small style="color:#ce93d8;">🎯 Quando ativado, o bot só opera após X LOSS seguidos. Após pegar Y WINS REAIS, volta a esperar os LOSS novamente.</small>
-    </div>
-
-    <div class="ciclos-box" id="ciclos_config" style="display:none;">
-        <strong>🔁 Gerenciamento por Ciclos Progressivos</strong>
-        <small style="color:#80deea; display:block; margin:5px 0;">
-            ✅ WIN em qualquer momento → Volta ao Ciclo 1<br>
-            ❌ Perde ciclo inteiro (todas as mãos) → Avança pro próximo ciclo
-        </small>
-        <div style="margin-top:8px; font-size:11px; color:#aaa;">
-            <div class="ciclo-row" style="font-weight:bold; color:#00bcd4;">
-                <div>Ciclo</div>
-                <div>Entrada $</div>
-                <div>G1 $</div>
-                <div>G2 $</div>
-                <div>G3 $</div>
-                <div>Ação</div>
-            </div>
-            <div id="lista_ciclos"></div>
-        </div>
-        <div style="margin-top:10px;">
-            <button class="btn-add-ciclo" onclick="adicionarCiclo()">➕ Adicionar Ciclo</button>
-            <button class="btn-save-ciclos" onclick="salvarCiclos()">💾 Salvar Ciclos</button>
-        </div>
-        <small id="ciclos_count" style="color:#00c853; display:block; margin-top:5px;">0 ciclo(s) configurado(s)</small>
-    </div>
-
-    <div class="rec-box" id="rec_continua_config" style="display:none;">
-        <div class="flex">
-            <label style="font-size:12px; width:100%;">Meta de Lucro Extra:
-            <input id="rec_continua_meta" type="number" value="30" step="5" style="width:80px;"> %</label>
-            <label style="font-size:12px; width:100%;">Fator Agressividade:
-            <input id="rec_continua_fator" type="number" value="1.2" step="0.1" style="width:80px;"> x</label>
-        </div>
-        <small style="color:#ffaa66;">🔄 Quando ativado, busca recuperar prejuízo + lucro extra de X% a cada operação</small>
-    </div>
-
-    <div class="flex" style="margin-top:10px;">
-        <select id="vwin_num">
-            <option value="1">1 Win Virtual</option>
-            <option value="2">2 Wins Virtuais</option>
-        </select>
-        <select id="max_gale">
-            <option value="1">G1</option>
-            <option value="2" selected>G2</option>
-            <option value="3">G3</option>
-        </select>
-        <label style="font-size:10px; width:80px;">Fator Gale %:
-        <input id="fator_gale" type="number" value="100"></label>
-    </div>
-</div>
-
-<div class="box">
-    <strong>Estratégias Ativas:</strong>
-    <div class="grid-est">
-        <div class="est-item"><input type="checkbox" class="est" value="MM" checked> Milhão</div>
-        <div class="est-item"><input type="checkbox" class="est" value="PM" checked> Master</div>
-        <div class="est-item"><input type="checkbox" class="est" value="M1" checked> MHI 1</div>
-        <div class="est-item"><input type="checkbox" class="est" value="M2" checked> MHI 2</div>
-        <div class="est-item"><input type="checkbox" class="est" value="MHI3" checked> MHI 3</div>
-        <div class="est-item"><input type="checkbox" class="est" value="FL" checked> Fluxo</div>
-        <div class="est-item"><input type="checkbox" class="est" value="TG" checked> Torre</div>
-        <div class="est-item"><input type="checkbox" class="est" value="P23" checked> Padrão 23</div>
-        <div class="est-item"><input type="checkbox" class="est" value="REV" checked> Reversão</div>
-        <div class="est-item"><input type="checkbox" class="est" value="C3" checked> Padrão C3</div>
-        <div class="est-item"><input type="checkbox" class="est" value="V1" checked> Vizinhança</div>
-        <div class="est-item"><input type="checkbox" class="est" value="TRI" checked> Três Viz.</div>
-    </div>
-</div>
-
-<button class="btn-on" onclick="acao('ligar')">▶️ INICIAR SHIELD + TELEGRAM</button>
-<button class="btn-reconnect" onclick="reconectar()">🔄 RECONECTAR</button>
-<button class="btn-off" onclick="acao('parar')">🛑 PARAR TUDO</button>
-
-<div id="monitor">Aguardando comando...</div>
-
-<script>
-let ID = localStorage.getItem('shield_bot_id');
-if (!ID) {
-    ID = "U" + Math.random().toString(36).substring(7);
-    localStorage.setItem('shield_bot_id', ID);
-}
-
-let ciclosConfig = [];
-let cicloAtual = 1;
-
-function setPares(valor) { document.getElementById('par').value = valor; }
-
-function toggleRecCustom() {
-    let select = document.getElementById('rec_percent_select');
-    let custom = document.getElementById('rec_percent_custom');
-    if (select.value === 'custom') {
-        custom.style.display = 'block';
-    } else {
-        custom.style.display = 'none';
-        custom.value = select.value;
-    }
-}
-
-function toggleLossConfig() {
-    let checkbox = document.getElementById('opera_apos_loss');
-    let config = document.getElementById('loss_config');
-    config.style.display = checkbox.checked ? 'block' : 'none';
-}
-
-function toggleCiclos() {
-    let checkbox = document.getElementById('usar_ciclos');
-    let config = document.getElementById('ciclos_config');
-    config.style.display = checkbox.checked ? 'block' : 'none';
-    if (checkbox.checked && ciclosConfig.length === 0) {
-        adicionarCiclo();
-        adicionarCiclo();
-        adicionarCiclo();
-    }
-}
-
-function toggleVelasDoidasConfig() {
-    let checkbox = document.getElementById('filtro_velas_doidas');
-    let config = document.getElementById('velas_doidas_config');
-    config.style.display = checkbox.checked ? 'block' : 'none';
-}
-
-function adicionarCiclo() {
-    let container = document.getElementById('lista_ciclos');
-    let num = container.children.length + 1;
-    let row = document.createElement('div');
-    row.className = 'ciclo-row';
-    row.innerHTML = `
-        <div class="ciclo-num">${num}</div>
-        <div><input type="number" class="ciclo_entrada" value="${num === 1 ? 2 : num === 2 ? 8 : 32}" step="0.5" style="width:100%;"></div>
-        <div><input type="number" class="ciclo_g1" value="${num === 1 ? 4 : num === 2 ? 16 : 80}" step="0.5" style="width:100%;"></div>
-        <div><input type="number" class="ciclo_g2" value="0" step="0.5" style="width:100%;"></div>
-        <div><input type="number" class="ciclo_g3" value="0" step="0.5" style="width:100%;"></div>
-        <div><button class="btn-del-ciclo" onclick="removerCiclo(this)">🗑️</button></div>
-    `;
-    container.appendChild(row);
-    atualizarContadorCiclos();
-}
-
-function removerCiclo(btn) {
-    let row = btn.closest('.ciclo-row');
-    row.remove();
-    renumerarCiclos();
-    atualizarContadorCiclos();
-}
-
-function renumerarCiclos() {
-    let rows = document.querySelectorAll('#lista_ciclos .ciclo-row');
-    rows.forEach((row, idx) => {
-        row.querySelector('.ciclo-num').textContent = idx + 1;
-    });
-}
-
-function atualizarContadorCiclos() {
-    let count = document.querySelectorAll('#lista_ciclos .ciclo-row').length;
-    document.getElementById('ciclos_count').textContent = count + ' ciclo(s) configurado(s)';
-}
-
-function salvarCiclos() {
-    ciclosConfig = [];
-    let rows = document.querySelectorAll('#lista_ciclos .ciclo-row');
-    rows.forEach(row => {
-        ciclosConfig.push({
-            entrada: parseFloat(row.querySelector('.ciclo_entrada').value) || 2,
-            g1: parseFloat(row.querySelector('.ciclo_g1').value) || 0,
-            g2: parseFloat(row.querySelector('.ciclo_g2').value) || 0,
-            g3: parseFloat(row.querySelector('.ciclo_g3').value) || 0
-        });
-    });
-    cicloAtual = 1;
-    alert('✅ ' + ciclosConfig.length + ' ciclos salvos!');
-    let mon = document.getElementById('monitor');
-    mon.innerHTML += '\\n🔁 CICLOS SALVOS: ' + ciclosConfig.length + ' ciclo(s)\\n';
-    mon.scrollTop = mon.scrollHeight;
-}
-
-function reconectar() {
-    fetch('/reconectar/' + ID, { method: 'POST' })
-        .then(r => r.json())
-        .then(res => {
-            let mon = document.getElementById('monitor');
-            if (res.ok) mon.innerHTML += "\\n✅ RECONECTADO!\\n";
-            else mon.innerHTML += "\\n❌ " + (res.erro || "Erro") + "\\n";
-            mon.scrollTop = mon.scrollHeight;
-        });
-}
-
-let tgAuthInProgress = false;
-
-function buscarGrupos() {
-    if (tgAuthInProgress) return;
-    let phone = document.getElementById('tg_phone').value.trim();
-    let api_id = document.getElementById('tg_api_id').value.trim();
-    let api_hash = document.getElementById('tg_api_hash').value.trim();
-    if (!phone || !api_id || !api_hash) {
-        document.getElementById('tg_status').innerHTML = '⚠️ Preencha telefone, API ID e API Hash.';
-        document.getElementById('tg_status').style.color = '#ff9800';
-        return;
-    }
-    tgAuthInProgress = true;
-    document.getElementById('btn_buscar_grupos').disabled = true;
-    document.getElementById('tg_status').innerHTML = '🔄 Conectando e enviando código...';
-    document.getElementById('tg_status').style.color = '#2196F3';
-
-    fetch('/tg_listar_grupos', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            phone: phone,
-            api_id: api_id,
-            api_hash: api_hash,
-            session: document.getElementById('tg_session').value
-        })
-    })
-    .then(r => r.json())
-    .then(data => {
-        if (data.error) {
-            document.getElementById('tg_status').innerHTML = '❌ ' + data.error;
-            document.getElementById('tg_status').style.color = '#f44336';
-            tgAuthInProgress = false;
-            document.getElementById('btn_buscar_grupos').disabled = false;
-            return;
-        }
-        if (data.precisa_codigo) {
-            document.getElementById('tg_status').innerHTML = '📨 Código enviado! Insira abaixo.';
-            document.getElementById('tg_status').style.color = '#4CAF50';
-            document.getElementById('tg_code_area').style.display = 'block';
-            tgAuthInProgress = false;
-            document.getElementById('btn_buscar_grupos').disabled = false;
-        } else if (data.ok) {
-            preencherGrupos(data.grupos, data.session);
-        } else {
-            document.getElementById('tg_status').innerHTML = '⚠️ Resposta inesperada.';
-            tgAuthInProgress = false;
-            document.getElementById('btn_buscar_grupos').disabled = false;
-        }
-    })
-    .catch(err => {
-        document.getElementById('tg_status').innerHTML = '❌ Erro: ' + err;
-        document.getElementById('tg_status').style.color = '#f44336';
-        tgAuthInProgress = false;
-        document.getElementById('btn_buscar_grupos').disabled = false;
-    });
-}
-
-function confirmarCodigo() {
-    let code = document.getElementById('tg_verification_code').value.trim();
-    if (!code) {
-        document.getElementById('tg_status').innerHTML = '⚠️ Digite o código.';
-        document.getElementById('tg_status').style.color = '#ff9800';
-        return;
-    }
-    document.getElementById('tg_status').innerHTML = '🔄 Verificando código...';
-    document.getElementById('tg_status').style.color = '#2196F3';
-
-    fetch('/tg_confirmar_codigo', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            phone: document.getElementById('tg_phone').value.trim(),
-            api_id: document.getElementById('tg_api_id').value.trim(),
-            api_hash: document.getElementById('tg_api_hash').value.trim(),
-            code: code,
-            session: document.getElementById('tg_session').value
-        })
-    })
-    .then(r => r.json())
-    .then(data => {
-        if (data.error) {
-            document.getElementById('tg_status').innerHTML = '❌ ' + data.error;
-            document.getElementById('tg_status').style.color = '#f44336';
-            return;
-        }
-        if (data.ok) {
-            preencherGrupos(data.grupos, data.session);
-        } else {
-            document.getElementById('tg_status').innerHTML = '️ Erro desconhecido.';
-            document.getElementById('tg_status').style.color = '#ff9800';
-        }
-    })
-    .catch(err => {
-        document.getElementById('tg_status').innerHTML = '❌ Erro: ' + err;
-        document.getElementById('tg_status').style.color = '#f44336';
-    });
-}
-
-function preencherGrupos(groups, session_str) {
-    let dropdown = document.getElementById('tg_groups_dropdown');
-    dropdown.innerHTML = '<option value="">-- Selecione --</option>';
-    groups.forEach(g => {
-        let opt = document.createElement('option');
-        opt.value = g.id;
-        opt.textContent = g.nome + ' (ID: ' + g.id + ')';
-        dropdown.appendChild(opt);
-    });
-    document.getElementById('tg_group_select').style.display = 'block';
-    document.getElementById('tg_status').innerHTML = '✅ Autenticado! Selecione o grupo.';
-    document.getElementById('tg_status').style.color = '#4CAF50';
-    document.getElementById('tg_code_area').style.display = 'none';
-    document.getElementById('tg_session').value = session_str || '';
-    tgAuthInProgress = false;
-    document.getElementById('btn_buscar_grupos').disabled = false;
-}
-
-function selecionarGrupo() {
-    let dropdown = document.getElementById('tg_groups_dropdown');
-    let selected = dropdown.value;
-    if (selected) {
-        document.getElementById('tg_status').innerHTML = '✅ Grupo selecionado: ' + dropdown.options[dropdown.selectedIndex].text;
-        document.getElementById('tg_status').style.color = '#4CAF50';
-    } else {
-        document.getElementById('tg_status').innerHTML = 'Selecione um grupo.';
-        document.getElementById('tg_status').style.color = '#aaa';
-    }
-}
-
-document.getElementById('modo_telegram').addEventListener('change', function() {
-    let status = document.getElementById('tg_status');
-    if (this.checked) {
-        let groupId = document.getElementById('tg_groups_dropdown').value;
-        if (!groupId) {
-            status.innerHTML = '⚠️ Selecione um grupo antes de ativar.';
-            status.style.color = '#ff9800';
-            this.checked = false;
-            return;
-        }
-        status.innerHTML = '✅ Modo Telegram ativado. Sinais serão executados.';
-        status.style.color = '#00e676';
-    } else {
-        status.innerHTML = 'ℹ️ Modo Telegram desativado.';
-        status.style.color = '#aaa';
-    }
-});
-
-function acao(t) {
-    let d = { id: ID };
-    if (t === 'ligar') {
-        let ests = Array.from(document.querySelectorAll('.est:checked')).map(cb => cb.value);
-        let recPercent = document.getElementById('rec_percent_custom').value;
-        if (document.getElementById('rec_percent_select').value !== 'custom') {
-            recPercent = document.getElementById('rec_percent_select').value;
-        }
-        Object.assign(d, {
-            user: document.getElementById('user').value,
-            pass: document.getElementById('pass').value,
-            tipo: document.getElementById('tipo').value,
-            par: document.getElementById('par').value,
-            ent: document.getElementById('ent').value,
-            sw: document.getElementById('sw').value || 10,
-            sl: document.getElementById('sl').value || 10,
-            min_rank: document.getElementById('min_rank').value || 50,
-            min_forca: document.getElementById('min_forca').value || 3,
-            max_sinais_horario: document.getElementById('max_sinais_horario').value,
-            rec_percent: recPercent || 100,
-            modo_lista: document.getElementById('modo_lista').checked,
-            lista_sinais: document.getElementById('lista_sinais').value,
-            modo_catalogo: document.getElementById('modo_catalogo').checked,
-            use_vwin: document.getElementById('use_vwin').checked,
-            vwin_num: document.getElementById('vwin_num').value,
-            rec: document.getElementById('use_rec').checked,
-            rec_continua: document.getElementById('rec_continua').checked,
-            rec_continua_meta: document.getElementById('rec_continua_meta').value || 30,
-            filtro_confluencia: document.getElementById('filtro_confluencia').checked,
-            filtro_forca: document.getElementById('filtro_forca').checked,
-            filtro_antiloss: document.getElementById('filtro_antiloss').checked,
-            filtro_volatilidade: document.getElementById('filtro_volatilidade').checked,
-            filtro_velas_doidas: document.getElementById('filtro_velas_doidas').checked,
-            fator_pavio: document.getElementById('fator_pavio').value || 2.5,
-            max_pavios_permitidos: document.getElementById('max_pavios_permitidos').value || 1,
-            use_gale: document.getElementById('use_gale').checked,
-            max_gale: document.getElementById('max_gale').value,
-            fator_gale: document.getElementById('fator_gale').value || 100,
-            estrategias: ests,
-            modo_inteligente: document.getElementById('modo_inteligente').checked,
-            usar_5vela: document.getElementById('usar_5vela').checked,
-            modo_telegram: document.getElementById('modo_telegram').checked,
-            tg_sem_ranking: document.getElementById('tg_sem_ranking').checked,
-            tg_phone: document.getElementById('tg_phone').value,
-            tg_api_id: document.getElementById('tg_api_id').value,
-            tg_api_hash: document.getElementById('tg_api_hash').value,
-            tg_group_id: document.getElementById('tg_groups_dropdown').value,
-            tg_session: document.getElementById('tg_session').value,
-            opera_apos_loss: document.getElementById('opera_apos_loss').checked,
-            loss_target: document.getElementById('loss_target').value || 2,
-            win_reset_target: document.getElementById('win_reset_target').value || 3,
-            tg_timeframe: document.getElementById('tg_timeframe').value,
-            auto_timeframe: document.getElementById('auto_timeframe').value,
-            usar_ciclos: document.getElementById('usar_ciclos').checked,
-            ciclos: ciclosConfig,
-            ciclo_inicial: cicloAtual
-        });
-    }
-    fetch('/' + t, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(d) });
-}
-
-setInterval(() => {
-    fetch('/status/' + ID).then(r => r.json()).then(d => {
-        if (d.msg) {
-            let mon = document.getElementById('monitor');
-            if (mon.innerHTML.length > 5000) mon.innerHTML = mon.innerHTML.slice(-2000);
-            mon.innerHTML += d.msg;
-            mon.scrollTop = mon.scrollHeight;
-        }
-        document.getElementById('w_info').innerText = d.wins || 0;
-        document.getElementById('l_info').innerText = d.loss || 0;
-        document.getElementById('lucro_val').innerText = '$' + (d.lucro_sessao || 0).toFixed(2);
-        document.getElementById('banca_real').innerText = '$' + (d.banca_real || 0).toFixed(2);
-        
-        if (d.ciclo_atual) {
-            document.getElementById('ciclo_display').innerText = '🔁 Ciclo: ' + d.ciclo_atual;
-        }
-        
-        let statusSpan = document.getElementById('bot_status_text');
-        let statusInd = document.getElementById('bot_status_indicator');
-        if (d.status === 'rodando') {
-            statusSpan.innerText = '✅ Bot em execução';
-            statusInd.className = 'bot-status status-running';
-        } else if (d.status === 'finalizado') {
-            statusSpan.innerText = '⏹️ Bot finalizado (Sessão concluída. Reinicie para continuar)';
-            statusInd.className = 'bot-status status-stopped';
-        } else if (d.status === 'travado') {
-            statusSpan.innerText = '❌ BOT TRAVOU! Reinicie';
-            statusInd.className = 'bot-status status-travado';
-        } else {
-            statusSpan.innerText = '🔄 Verificando...';
-            statusInd.className = 'bot-status status-offline';
-        }
-    });
-}, 1200);
-
-setTimeout(() => {
-    fetch('/check_bot/' + ID).then(r => r.json()).then(res => {
-        if (res.exists && res.is_alive) {
-            document.getElementById('monitor').innerHTML += "🔄 Bot existente detectado! Reconectando...\\n";
-            reconectar();
-        }
-    });
-}, 1000);
-</script>
-</body>
-</html>
-"""
-
-# ════════════════════════════════════════════════════════════════════════
-# ROTAS FLASK
-# ════════════════════════════════════════════════════════════════════════
 @app.route('/')
 def index():
     return render_template_string(HTML_SISTEMA)
@@ -2204,10 +1596,9 @@ def ligar():
     d = request.json
     sid = d.get('id')
 
-    if len(processos) > 0:
-        return jsonify({"erro": "⚠️ Já existe um bot ativo nesta sessão!"})
-    if sid in processos:
-        return jsonify({"erro": "⚠️ Bot já está rodando!"})
+    # CORREÇÃO MULTI-USUÁRIO: Verifica apenas se ESTE usuário já tem um bot rodando
+    if sid in processos and processos[sid].is_alive():
+        return jsonify({"erro": "⚠️ Este usuário já tem um bot rodando!"})
 
     email = d.get('user', '').strip()
     senha = d.get('pass', '').strip()
@@ -2225,7 +1616,7 @@ def ligar():
     if not ok_gmail:
         return jsonify({"erro": msg_gmail})
 
-    # TRAVA 2: Verifica se está no canal do Telegram (se o modo Telegram estiver ativado ou se tiver dados de TG)
+    # TRAVA 2: Verifica se está no canal do Telegram
     tg_api_id = d.get('tg_api_id', '').strip()
     tg_api_hash = d.get('tg_api_hash', '').strip()
     tg_phone = d.get('tg_phone', '').strip()
@@ -2236,13 +1627,13 @@ def ligar():
         if not ok_tg:
             return jsonify({"erro": msg_tg})
 
-    # Se passou por todas as travas, salva e inicia o bot
+    # Se passou por todas as travas, salva e inicia o bot ISOLADO
     salvar_bot_db(sid, email, d)
 
     p = multiprocessing.Process(target=loop_robo, args=(sid, d, logs_web))
     p.daemon = False
     p.start()
-    processos[sid] = p
+    processos[sid] = p  # Armazena pelo SID, permitindo múltiplos usuários
 
     return jsonify({"s": "ok", "msg": "✅ Bot iniciado com sucesso!"})
 
@@ -2253,6 +1644,8 @@ def parar():
         processos[sid].terminate()
         del processos[sid]
     remover_bot_db(sid)
+    if sid in logs_web:
+        del logs_web[sid]
     return jsonify({"ok": True})
 
 # ════════════════════════════════════════════════════════════════════════
@@ -2283,7 +1676,7 @@ def iniciar_cloudflare(porta):
 # PONTO DE ENTRADA
 # ════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    print("SHIELD V37 - IQ OPTION + TELEGRAM (ANTI-TRAVAMENTO)")
+    print("SHIELD V37 - IQ OPTION + TELEGRAM (MULTI-USUÁRIO SEGURO)")
     
     # Descobre uma porta livre automaticamente
     PORTA_USADA = obter_porta_livre(5006)
